@@ -31,7 +31,7 @@ export class WebRTCManager {
   private onRemoteStream?: (stream: MediaStream, userId: string) => void;
   private onUserJoined?: (userId: string) => void;
   private onUserLeft?: (userId: string) => void;
-  private readonly MAX_RETRY_ATTEMPTS = 3;
+  private readonly MAX_RETRY_ATTEMPTS = 5; // Increased from 3 to 5 for better recovery
   private readonly RETRY_DELAY_BASE = 1000; // 1 second base delay
 
   constructor(config: WebRTCConfig) {
@@ -150,6 +150,66 @@ export class WebRTCManager {
       this.closePeerConnection(userId);
       this.onUserLeft?.(userId);
     });
+
+    // Listen for peer connection state changes (from viewer to broadcaster)
+    this.socket.on('peer-connection-state', ({ userId, targetUserId, connectionState, iceConnectionState }) => {
+      // If we're a broadcaster and a viewer (userId) reports connection failure to us (targetUserId is us)
+      // Or if we're a viewer and broadcaster reports state (for logging purposes)
+      if (this.config.userType === 'broadcaster' && targetUserId === this.config.userId) {
+        // A viewer (userId) is reporting their connection state to us (broadcaster)
+        console.log(`📢 Viewer ${userId} reports connection state: ${connectionState} (ICE: ${iceConnectionState})`);
+        
+        if (connectionState === 'failed' || iceConnectionState === 'failed' || 
+            connectionState === 'disconnected' || iceConnectionState === 'disconnected') {
+          console.log(`🔄 Broadcaster initiating ICE restart for failed viewer connection: ${userId}`);
+          // Directly restart ICE as broadcaster when viewer reports failure
+          this.restartIceForPeer(userId);
+        }
+      }
+    });
+  }
+
+  private async restartIceForPeer(userId: string) {
+    // This is called when broadcaster detects viewer failure
+    const pc = this.peerConnections.get(userId);
+    if (!pc) {
+      console.warn(`No peer connection found for ${userId}, creating new offer...`);
+      // Create new offer if connection doesn't exist
+      await this.createOffer(userId);
+      return;
+    }
+
+    // Check if we should retry
+    const state = this.connectionStates.get(userId);
+    if (state && state.retryCount >= this.MAX_RETRY_ATTEMPTS) {
+      console.error(`❌ Max retry attempts reached for ${userId}, skipping ICE restart`);
+      return;
+    }
+
+    if (state) {
+      state.retryCount++;
+      state.lastRetryTime = Date.now();
+    }
+
+    try {
+      console.log(`🔄 Broadcaster creating ICE restart offer for viewer ${userId}`);
+      const offer = await pc.createOffer({ iceRestart: true });
+      await pc.setLocalDescription(offer);
+
+      // Wait for ICE gathering
+      await this.waitForIceGathering(pc, 5000);
+
+      if (this.socket) {
+        this.socket.emit('offer', {
+          offer: pc.localDescription,
+          targetUserId: userId,
+          roomId: this.config.roomId,
+        });
+        console.log(`📤 Sent ICE restart offer to viewer ${userId}`);
+      }
+    } catch (error) {
+      console.error(`Error creating ICE restart offer for viewer ${userId}:`, error);
+    }
   }
 
   private createPeerConnection(userId: string): RTCPeerConnection {
@@ -188,7 +248,33 @@ export class WebRTCManager {
     // Handle ICE candidates with proper logging
     pc.onicecandidate = (event) => {
       if (event.candidate && this.socket) {
-        console.log(`📡 ICE candidate gathered for ${userId}:`, event.candidate.candidate.substring(0, 50) + '...');
+        // Parse ICE candidate type for diagnostics
+        const candidateStr = event.candidate.candidate;
+        let candidateType = 'unknown';
+        let protocol = 'unknown';
+        
+        // Extract candidate type (host, srflx, relay, prflx)
+        const typeMatch = candidateStr.match(/typ (\w+)/);
+        if (typeMatch) {
+          candidateType = typeMatch[1];
+        }
+        
+        // Extract protocol
+        if (candidateStr.includes(' UDP ')) {
+          protocol = 'UDP';
+        } else if (candidateStr.includes(' TCP ')) {
+          protocol = 'TCP';
+        }
+        
+        // Log candidate type for diagnostics
+        const typeEmoji = candidateType === 'relay' ? '🔄' : candidateType === 'srflx' ? '🌐' : '🏠';
+        console.log(`📡 ICE candidate gathered for ${userId}: ${typeEmoji} ${candidateType}/${protocol} - ${candidateStr.substring(0, 60)}...`);
+        
+        // Warn if no relay candidates (needed for cross-network)
+        if (candidateType === 'relay') {
+          console.log(`✅ TURN server working! Relay candidate found for ${userId}`);
+        }
+        
         this.socket.emit('ice-candidate', {
           candidate: event.candidate,
           targetUserId: userId,
@@ -196,6 +282,21 @@ export class WebRTCManager {
         });
       } else if (!event.candidate) {
         console.log(`✅ ICE gathering completed for ${userId}`);
+        
+        // Check if we have relay candidates (critical for cross-network)
+        const stats = pc.getStats();
+        stats.then(statReport => {
+          let hasRelay = false;
+          statReport.forEach((report) => {
+            if (report.type === 'local-candidate' && report.candidateType === 'relay') {
+              hasRelay = true;
+            }
+          });
+          
+          if (!hasRelay && this.peerConnections.size > 0) {
+            console.warn(`⚠️ No relay candidates found for ${userId}. Cross-network connectivity may fail. Consider configuring TURN server.`);
+          }
+        });
       }
     };
 
@@ -207,6 +308,18 @@ export class WebRTCManager {
     // Handle ICE connection state changes
     pc.oniceconnectionstatechange = () => {
       console.log(`ICE connection state for ${userId}:`, pc.iceConnectionState);
+      
+      // Notify the other peer about connection state changes (for broadcaster to detect viewer failures)
+      if (this.socket && (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected' || 
+                          pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed')) {
+        this.socket.emit('peer-connection-state', {
+          userId: this.config.userId,
+          targetUserId: userId,
+          roomId: this.config.roomId,
+          connectionState: pc.iceConnectionState,
+          iceConnectionState: pc.iceConnectionState,
+        });
+      }
       
       if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
         console.warn(`⚠️ ICE connection ${pc.iceConnectionState} for ${userId}, attempting recovery...`);
@@ -226,13 +339,35 @@ export class WebRTCManager {
     pc.onconnectionstatechange = () => {
       console.log(`Connection state with ${userId}:`, pc.connectionState);
       
+      // Notify the other peer about connection state changes (for broadcaster to detect viewer failures)
+      if (this.socket) {
+        this.socket.emit('peer-connection-state', {
+          userId: this.config.userId,
+          targetUserId: userId,
+          roomId: this.config.roomId,
+          connectionState: pc.connectionState,
+          iceConnectionState: pc.iceConnectionState,
+        });
+      }
+      
       if (pc.connectionState === 'failed') {
         console.error(`❌ Connection failed for ${userId}, attempting recovery...`);
         this.handleConnectionFailure(userId);
       } else if (pc.connectionState === 'disconnected') {
         console.warn(`⚠️ Connection disconnected for ${userId}`);
+        // Also try recovery on disconnected state
+        if (this.config.userType === 'broadcaster') {
+          // Broadcaster should attempt recovery for disconnected viewers
+          this.handleConnectionFailure(userId);
+        }
       } else if (pc.connectionState === 'connected') {
         console.log(`✅ Connection established with ${userId}`);
+        // Reset retry count on successful connection
+        const state = this.connectionStates.get(userId);
+        if (state) {
+          state.retryCount = 0;
+          state.isRetrying = false;
+        }
       }
     };
 

@@ -13,6 +13,11 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
+# Create public directory if it doesn't exist (Next.js may need it)
+# Add a placeholder file if directory is empty to ensure COPY works
+RUN mkdir -p public && \
+    touch public/.gitkeep || true
+
 # Set build-time environment variables if needed
 ENV NEXT_TELEMETRY_DISABLED 1
 
@@ -29,11 +34,11 @@ ENV NEXT_TELEMETRY_DISABLED 1
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
 
-# Copy necessary files from builder
+# Copy public directory from builder
 COPY --from=builder /app/public ./public
 
 # Set the correct permission for prerender cache
-RUN mkdir .next
+RUN mkdir -p .next
 RUN chown nextjs:nodejs .next
 
 # Copy standalone build
@@ -48,4 +53,3 @@ ENV PORT 3000
 ENV HOSTNAME "0.0.0.0"
 
 CMD ["node", "server.js"]
-
